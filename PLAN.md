@@ -285,7 +285,7 @@ docker compose up
 
 **Key Classes/Functions**:
 - `Spider` class
-  - `async def crawl(start_url: str) -> dict[str, set[str]]`
+  - `def crawl(start_url: str) -> dict[str, set[str]]`
   - Returns: Map of source page URL → set of linked URLs
 
 **Algorithm**:
@@ -299,13 +299,21 @@ docker compose up
    - Check `<nav>` elements
 4. Deduplicate URLs
 5. Stay within same origin (Docker container)
-6. Use `asyncio` + `httpx` for concurrency
+6. Use `ThreadPoolExecutor` + `httpx.Client` for concurrency
 
 **Performance Optimization**:
-- Semaphore to limit concurrent requests (20)
-- Connection pooling via httpx.AsyncClient
+- ThreadPoolExecutor with configurable workers (default: 20)
+- Connection pooling via httpx.Client (reusable across threads)
 - LRU cache for visited URLs
 - Early termination on repeated errors
+
+**Concurrency Strategy Rationale**:
+Since we're checking against a **local Docker container**, the task is primarily **compute-bound** (HTML parsing with BeautifulSoup) rather than network I/O bound. Threading is optimal because:
+- httpx releases the GIL during HTTP calls (even to localhost)
+- Thread-based concurrency handles the "some I/O + some compute" mix efficiently
+- Lower memory overhead than multiprocessing
+- Simpler implementation than asyncio for this use case
+- Connection pooling straightforward with httpx.Client
 
 **Data Structures**:
 ```python
@@ -326,7 +334,7 @@ docker compose up
 
 **Key Classes/Functions**:
 - `LinkChecker` class
-  - `async def check_links(link_map: dict) -> dict[str, list[BrokenLink]]`
+  - `def check_links(link_map: dict) -> dict[str, list[BrokenLink]]`
   - Returns: Map of source page → list of broken links
 
 **Check Types**:
@@ -371,10 +379,11 @@ class BrokenLink:
 ```
 
 **Performance Optimization**:
-- Concurrent checking with asyncio
-- Reuse HTTP client connections
-- Cache results for duplicate URLs
+- Concurrent checking with ThreadPoolExecutor
+- Reuse HTTP client connections (httpx.Client with connection pooling)
+- Cache results for duplicate URLs (thread-safe cache)
 - External link checking with timeout (5s)
+- Thread-safe result accumulation
 
 #### 4. `link_check/nav_validator.py`
 **Purpose**: Validate MkDocs navigation structure
@@ -555,7 +564,7 @@ name = "link-check"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-    "httpx>=0.27.0",           # Async HTTP client
+    "httpx>=0.27.0",           # HTTP client with connection pooling
     "beautifulsoup4>=4.12.0",   # HTML parsing
     "pyyaml>=6.0.0",            # YAML output
     "click>=8.1.0",             # CLI framework
@@ -566,7 +575,6 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
-    "pytest-asyncio>=0.23.0",
     "pytest-cov>=4.1.0",
     "pytest-mock>=3.12.0",
     "black>=24.0.0",
@@ -585,7 +593,6 @@ testpaths = ["tests"]
 python_files = "test_*.py"
 python_functions = "test_*"
 addopts = "--cov=link_check --cov-report=html --cov-report=term"
-asyncio_mode = "auto"
 ```
 
 ### Ruff Configuration (`ruff.toml`)
@@ -627,6 +634,7 @@ ignore = [
 - Test handling of relative vs absolute URLs
 - Test malformed HTML handling
 - Mock HTTP responses
+- Test thread-safe operations
 
 **`tests/test_checker.py`**:
 - Test 404 detection
@@ -635,6 +643,8 @@ ignore = [
 - Test timeout handling
 - Test connection error handling
 - Mock HTTP responses
+- Test thread-safe caching
+- Test concurrent link checking
 
 **`tests/test_nav_validator.py`**:
 - Test YAML parsing
@@ -680,21 +690,30 @@ ignore = [
 
 **Goal**: Check ~150 pages with ~5000 links in under 5 minutes on local Docker
 
-**Strategies**:
-1. **Concurrency**: 20 workers (tunable)
-2. **Connection Pooling**: Reuse HTTP connections
-3. **Caching**: Cache checked URLs (avoid duplicate checks)
+**Concurrency Strategy**:
+Since we're checking against a **local Docker container on localhost**, the task is primarily **compute-bound** (HTML parsing, URL processing) rather than network I/O bound. We use **ThreadPoolExecutor** because:
+
+- **Why not AsyncIO?** AsyncIO excels at I/O-bound tasks with high latency (remote servers). For localhost, network overhead is minimal, making the GIL-bound compute work the bottleneck.
+- **Why not Multiprocessing?** While true parallelism would help, the memory overhead and serialization costs outweigh benefits for this mixed workload.
+- **Why Threading?** httpx releases the GIL during HTTP calls (even localhost), and threads handle the "some I/O + some compute" mix efficiently with lower overhead.
+
+**Optimization Strategies**:
+1. **Threading Concurrency**: ThreadPoolExecutor with 20 workers (tunable)
+2. **Connection Pooling**: httpx.Client connection pooling (reused across threads)
+3. **Thread-Safe Caching**: Cache checked URLs to avoid duplicate checks
 4. **HEAD Requests**: Use HEAD instead of GET when possible
-5. **Batch Processing**: Check links in batches
-6. **Early Termination**: Stop checking if too many errors
+5. **Batch Processing**: Process URLs in batches to reduce overhead
+6. **Early Termination**: Stop checking if error rate exceeds threshold
 7. **Smart Queueing**: Prioritize internal links over external
 
-**Benchmarking**:
+**Benchmarking & Tuning**:
 - Measure time for crawling phase
 - Measure time for checking phase
 - Measure time for nav validation
 - Measure total time
 - Provide `--profile` flag to show timing breakdown
+- Test different worker counts (10, 20, 30, 50) to find optimal value
+- Consider adding `--strategy` flag to compare threading vs asyncio vs multiprocessing
 
 ### Usage Examples
 
